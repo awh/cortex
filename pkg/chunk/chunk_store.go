@@ -84,6 +84,8 @@ type store struct {
 	schema Schema
 	limits *validation.Overrides
 	*Fetcher
+
+	aliasLookup AliasLookup
 }
 
 func newStore(cfg StoreConfig, schema Schema, index IndexClient, chunks ObjectClient, limits *validation.Overrides) (Store, error) {
@@ -99,6 +101,10 @@ func newStore(cfg StoreConfig, schema Schema, index IndexClient, chunks ObjectCl
 		schema:  schema,
 		limits:  limits,
 		Fetcher: fetcher,
+
+		// Eventually we would wire in an implementation backed by the config
+		// store, allowing tenants to supply their own alias history
+		aliasLookup: &nilAliasLookup{},
 	}, nil
 }
 
@@ -185,7 +191,67 @@ func (c *store) Get(ctx context.Context, from, through model.Time, allMatchers .
 	}
 
 	log.Span.SetTag("metric", metricName)
-	return c.getMetricNameChunks(ctx, from, through, matchers, metricName)
+
+	userID, err := user.ExtractOrgID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	aliases := c.aliasLookup.GetAliases(userID, metricName)
+	if aliases == nil {
+		return c.getMetricNameChunks(ctx, from, through, matchers, metricName)
+	} else {
+		var chunks []Chunk
+		var nextFrom, nextThrough model.Time
+
+		// This algorithm relies on some contractual guarantees waranted by the
+		// AliasLookup interface - see the method documentation for details.
+		//
+		// We're also assuming here that when a metric is renamed, the series
+		// chunk for a given fingerprint eventually idles out with an end time
+		// that is before the start time of the new chunk that is its
+		// spiritual successor (e.g. the one pertaining to same set of labels
+		// under the new name).  Because of this,
+		// chunkStoreQuerier.partitionChunks will reassemble the chunks into
+		// SeriesSets with ascending non-overlapping chunks based on their
+		// matching fingerprint; the fact that the cutover in the metric name
+		// may be smeared over a time window doesn't matter, because the
+		// reconstruction is happening at the level of individual series.
+
+		for _, alias := range aliases {
+			// If the alias ends before the requested range, skip it
+			if alias.until.Before(from) {
+				continue
+			}
+
+			// If the alias starts after the requested range, we're done
+			if alias.from.After(until) {
+				break
+			}
+
+			// Clamp the start of our subquery to the start of the alias if necessary
+			if alias.from.After(from) {
+				nextFrom = alias.from
+			} else {
+				nextFrom = from
+			}
+
+			// Clamp the end of our subquery to the end of the alias if necessary
+			if alias.until.Before(through) {
+				nextThrough = alias.until
+			} else {
+				nextThrough = through
+			}
+
+			aliasChunks, err := c.getMetricNameChunks(ctx, nextFrom, nextThrough, matchers, alias.name)
+			if err != nil {
+				return nil, err
+			}
+
+			chunks = append(chunks, aliasChunks...)
+		}
+		return chunks, nil
+	}
 }
 
 func (c *store) validateQuery(ctx context.Context, from model.Time, through *model.Time, matchers []*labels.Matcher) (string, []*labels.Matcher, bool, error) {
